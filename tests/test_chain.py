@@ -9,7 +9,15 @@ from langchain_core.messages import AIMessage
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import ValidationError
 
-from chain import MAX_INTENTOS, PROMPT, build_chain, registrar_intento, validar_salida
+from chain import (
+    MAX_INTENTOS,
+    PROMPT,
+    build_chain,
+    cadena_por_defecto,
+    process_text,
+    registrar_intento,
+    validar_salida,
+)
 from errors import SalidaIncompletaError, SalidaInvalidaError
 from schemas import Criticidad, ExtraccionTecnica
 from tests.fakes import FakeChatModel, error_de_conexion, error_http, mensaje_con_herramienta
@@ -199,3 +207,40 @@ async def test_cada_invocacion_cuenta_intentos_desde_uno(caplog):
     await chain.ainvoke(dict(ENTRADA))
     assert caplog.text.count("Intento 1:") == 2
     assert "Intento 2:" not in caplog.text
+
+
+# --- process_text -------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("texto", ["", "   ", "\n\t"])
+async def test_process_text_rechaza_texto_vacio_sin_llamar_al_modelo(texto):
+    chain, modelo = cadena_con(mensaje_con_herramienta(ARGS_OK))
+    with pytest.raises(ValueError, match="vacío"):
+        await process_text(texto, chain)
+    assert modelo.llamadas == 0
+
+
+async def test_process_text_devuelve_el_objeto_y_loguea_inicio_y_fin(caplog):
+    caplog.set_level(logging.INFO, logger="pipeline")
+    chain, _ = cadena_con(mensaje_con_herramienta(ARGS_OK))
+    resultado = await process_text(ENTRADA["texto"], chain)
+    assert isinstance(resultado, ExtraccionTecnica)
+    assert f"Procesando texto de {len(ENTRADA['texto'])} caracteres" in caplog.text
+    assert "Listo en" in caplog.text
+
+
+async def test_process_text_loguea_error_y_propaga_si_se_agotan_los_reintentos(caplog):
+    caplog.set_level(logging.ERROR, logger="pipeline")
+    chain, _ = cadena_con(*[mensaje_con_herramienta(ARGS_MAL)] * MAX_INTENTOS)
+    with pytest.raises(SalidaInvalidaError):
+        await process_text(ENTRADA["texto"], chain)
+    assert "Reintentos agotados o error permanente: SalidaInvalidaError" in caplog.text
+
+
+async def test_process_text_sin_cadena_construye_la_real_desde_el_entorno(monkeypatch):
+    """Sin keys, la cadena por defecto falla con un error de configuración claro."""
+    for var in ("LLM_PROVIDER", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    cadena_por_defecto.cache_clear()
+    with pytest.raises(ValueError, match="ANTHROPIC_API_KEY"):
+        await process_text("un texto")

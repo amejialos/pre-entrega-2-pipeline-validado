@@ -8,12 +8,15 @@ todo envuelto en `.with_retry(retry_if_exception_type=RECUPERABLES, stop_after_a
 """
 
 import logging
+import time
+from functools import cache
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable, RunnableLambda
 
 from errors import RECUPERABLES, SalidaIncompletaError, SalidaInvalidaError
+from providers import build_model
 from schemas import ExtraccionTecnica
 
 logger = logging.getLogger("pipeline")
@@ -103,3 +106,32 @@ def build_chain(model: BaseChatModel, *, con_espera: bool = True) -> Runnable:
         stop_after_attempt=MAX_INTENTOS,
         wait_exponential_jitter=con_espera,
     )
+
+
+@cache
+def cadena_por_defecto() -> Runnable:
+    """La cadena real, construida una sola vez a partir del entorno."""
+    return build_chain(build_model())
+
+
+async def process_text(text: str, chain: Runnable | None = None) -> ExtraccionTecnica:
+    """Procesa un texto y devuelve el objeto validado.
+
+    Lanza ValueError si el texto está vacío (sin llamar al modelo) y deja propagar
+    la última excepción de la cadena si se agotaron los reintentos o el error es
+    permanente: el llamador decide qué hacer.
+    """
+    if not text or not text.strip():
+        raise ValueError("El texto no puede estar vacío")
+    if chain is None:
+        chain = cadena_por_defecto()
+
+    logger.info("Procesando texto de %d caracteres", len(text))
+    inicio = time.perf_counter()
+    try:
+        resultado = await chain.ainvoke({"texto": text})
+    except Exception as error:
+        logger.error("Reintentos agotados o error permanente: %s: %s", type(error).__name__, error)
+        raise
+    logger.info("Listo en %.1f s", time.perf_counter() - inicio)
+    return resultado
