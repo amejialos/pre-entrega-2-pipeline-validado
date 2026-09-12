@@ -1,0 +1,30 @@
+[project]
+name = "pipeline-validado"
+version = "0.1.0"
+description = "Pre-entrega 2: pipeline de extracción de entidades técnicas con LCEL, Pydantic y reintentos"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "langchain-core>=1.6.3",
+    "langchain-openai>=1.6.2",
+    "langchain-anthropic>=1.7.2",
+    "pydantic>=2.13.5",
+    "python-dotenv>=1.2.3",
+]
+
+# No es un paquete instalable: los módulos viven en la raíz y se importan desde ahí.
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "httpx2>=2.12.0",
+]
