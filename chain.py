@@ -1,0 +1,82 @@
+"""La cadena LCEL: prompt -> modelo con salida estructurada -> validación, con reintentos.
+
+    registrar_intento | PROMPT | model.with_structured_output(ExtraccionTecnica, include_raw=True) | validar_salida
+
+todo envuelto en `.with_retry(retry_if_exception_type=RECUPERABLES, stop_after_attempt=3)`.
+`process_text` es la puerta de entrada: recibe un string y devuelve un
+`ExtraccionTecnica` validado, o lanza una excepción si se agotaron los intentos.
+"""
+
+import logging
+
+from langchain_core.prompts import ChatPromptTemplate
+
+from errors import SalidaIncompletaError, SalidaInvalidaError
+from schemas import ExtraccionTecnica
+
+logger = logging.getLogger("pipeline")
+
+SYSTEM_PROMPT = """Sos un analista técnico senior. Recibís un texto crudo (una descripción de \
+arquitectura de software, un log de error, un reporte de incidente) y extraés información \
+estructurada.
+
+Completá los tres campos:
+- tecnologias: cada tecnología, framework, servicio, base de datos o herramienta mencionada, \
+con su nombre canónico (por ejemplo "FastAPI", no "fastapi" ni "una API en Python"). No \
+inventes tecnologías que no aparezcan en el texto. Si el texto no menciona ninguna con \
+claridad, indicá la más probable a partir del contexto.
+- nivel_de_criticidad: "alta" si describe una caída, pérdida de datos o un error activo en \
+producción; "media" si describe degradación, riesgo latente o un problema acotado; "baja" si \
+es informativo, una mejora o no tiene impacto operativo.
+- resumen_tecnico: una o dos oraciones, en español, que resuman el sistema o el problema en \
+términos técnicos.
+
+Respondé únicamente con la estructura pedida."""
+
+# La única variable de entrada es `texto`. Sin f-strings: LangChain gestiona la sustitución.
+PROMPT = ChatPromptTemplate.from_messages(
+    [
+        ("system", SYSTEM_PROMPT),
+        ("human", "Texto a analizar:\n\n{texto}"),
+    ]
+)
+
+# Cómo avisa cada proveedor que cortó la respuesta por falta de tokens.
+CORTES_POR_TOKENS = {"finish_reason": "length", "stop_reason": "max_tokens"}
+
+
+def registrar_intento(entrada: dict) -> dict:
+    """Primer eslabón: cuenta el intento y lo loguea.
+
+    `with_retry` reutiliza el mismo diccionario de entrada en cada intento, así
+    que el contador sobrevive entre reintentos de una misma invocación.
+    """
+    entrada["intento"] = entrada.get("intento", 0) + 1
+    logger.info("Intento %d: enviando %d caracteres al modelo", entrada["intento"], len(entrada["texto"]))
+    return entrada
+
+
+def validar_salida(salida: dict) -> ExtraccionTecnica:
+    """Último eslabón: convierte {raw, parsed, parsing_error} en un objeto o en una excepción.
+
+    Primero revisa el corte por tokens: un JSON truncado a veces parsea igual por
+    casualidad, así que no alcanza con mirar `parsed`.
+    """
+    meta = salida["raw"].response_metadata or {}
+    for clave, valor in CORTES_POR_TOKENS.items():
+        if meta.get(clave) == valor:
+            logger.warning("Salida incompleta: el modelo cortó por falta de tokens (%s=%s)", clave, valor)
+            raise SalidaIncompletaError(f"El modelo cortó la respuesta por falta de tokens ({clave}={valor})")
+
+    if salida.get("parsing_error") is not None or salida.get("parsed") is None:
+        detalle = salida.get("parsing_error") or "el modelo no devolvió la estructura pedida"
+        logger.warning("Salida inválida, no cumple el esquema: %s", detalle)
+        raise SalidaInvalidaError(f"La salida no cumple el esquema: {detalle}")
+
+    resultado: ExtraccionTecnica = salida["parsed"]
+    logger.info(
+        "Salida válida (%d tecnologías, criticidad %s)",
+        len(resultado.tecnologias),
+        resultado.nivel_de_criticidad.value,
+    )
+    return resultado
