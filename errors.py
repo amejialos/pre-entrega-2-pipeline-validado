@@ -23,7 +23,9 @@ class SalidaInvalidaError(PipelineError):
 
 
 # Errores que un nuevo intento puede resolver. Todo lo demás es permanente.
-# APITimeoutError hereda de APIConnectionError en ambos SDKs.
+# APITimeoutError hereda de APIConnectionError en ambos SDKs. LangChain envuelve los
+# errores de los SDKs en clases propias (OpenAIAPIError, AnthropicOverloadedError...)
+# que heredan de estas, así que la clasificación se conserva.
 RECUPERABLES: tuple[type[BaseException], ...] = (
     SalidaIncompletaError,
     SalidaInvalidaError,
@@ -33,4 +35,5 @@ RECUPERABLES: tuple[type[BaseException], ...] = (
     anthropic.RateLimitError,
     anthropic.APIConnectionError,
     anthropic.InternalServerError,
+    anthropic.OverloadedError,  # 529: sobrecarga momentánea, no hereda de InternalServerError
 )

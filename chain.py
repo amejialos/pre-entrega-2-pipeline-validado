@@ -11,6 +11,7 @@ import logging
 import time
 from functools import cache
 
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models import BaseChatModel
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable, RunnableLambda
@@ -89,6 +90,18 @@ def validar_salida(salida: dict) -> ExtraccionTecnica:
     return resultado
 
 
+class LogDeErroresDelModelo(BaseCallbackHandler):
+    """Loguea los errores que lanza el proveedor (429, 5xx, red).
+
+    Esos errores no pasan por `validar_salida`, así que sin este callback un reintento
+    por rate limit no dejaría rastro en los logs. `on_llm_error` es el hook estándar
+    de LangChain para fallos del modelo.
+    """
+
+    def on_llm_error(self, error: BaseException, **kwargs) -> None:
+        logger.warning("El proveedor falló: %s: %s", type(error).__name__, error)
+
+
 def build_chain(model: BaseChatModel, *, con_espera: bool = True) -> Runnable:
     """Arma la cadena completa: entrada {"texto": str}, salida ExtraccionTecnica.
 
@@ -97,14 +110,18 @@ def build_chain(model: BaseChatModel, *, con_espera: bool = True) -> Runnable:
     quita la espera (para tests). Un error permanente (auth, 400) sale al primer intento.
     """
     return (
-        RunnableLambda(registrar_intento)
-        | PROMPT
-        | model.with_structured_output(ExtraccionTecnica, include_raw=True)
-        | RunnableLambda(validar_salida)
-    ).with_retry(
-        retry_if_exception_type=RECUPERABLES,
-        stop_after_attempt=MAX_INTENTOS,
-        wait_exponential_jitter=con_espera,
+        (
+            RunnableLambda(registrar_intento)
+            | PROMPT
+            | model.with_structured_output(ExtraccionTecnica, include_raw=True)
+            | RunnableLambda(validar_salida)
+        )
+        .with_retry(
+            retry_if_exception_type=RECUPERABLES,
+            stop_after_attempt=MAX_INTENTOS,
+            wait_exponential_jitter=con_espera,
+        )
+        .with_config(callbacks=[LogDeErroresDelModelo()])
     )
 
 

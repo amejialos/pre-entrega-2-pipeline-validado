@@ -174,10 +174,13 @@ async def test_invalida_tres_veces_agota_los_reintentos():
     assert modelo.llamadas == MAX_INTENTOS
 
 
-async def test_rate_limit_se_reintenta():
-    chain, modelo = cadena_con(error_http(openai.RateLimitError, 429), mensaje_con_herramienta(ARGS_OK))
+async def test_rate_limit_se_reintenta_y_queda_en_el_log(caplog):
+    caplog.set_level(logging.WARNING, logger="pipeline")
+    chain, modelo = cadena_con(error_http(openai.RateLimitError, 429, "429 demasiadas requests"), mensaje_con_herramienta(ARGS_OK))
     await chain.ainvoke(dict(ENTRADA))
     assert modelo.llamadas == 2
+    # Los errores del proveedor no pasan por el validador: los loguea el callback on_llm_error.
+    assert "El proveedor falló: RateLimitError: 429 demasiadas requests" in caplog.text
 
 
 async def test_error_de_conexion_de_anthropic_se_reintenta():
