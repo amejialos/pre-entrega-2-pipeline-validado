@@ -119,10 +119,15 @@ RECUPERABLES: tuple[type[BaseException], ...] = (
     SalidaInvalidaError,
     openai.RateLimitError, openai.APIConnectionError, openai.InternalServerError,
     anthropic.RateLimitError, anthropic.APIConnectionError, anthropic.InternalServerError,
+    anthropic.OverloadedError,   # 529, no hereda de InternalServerError
 )
 ```
 
 `APITimeoutError` hereda de `APIConnectionError` en ambos SDKs, así que queda cubierto.
+LangChain envuelve los errores de los SDKs en clases propias (`OpenAIAPIError`,
+`AnthropicOverloadedError`, `AnthropicAuthenticationError`...) que heredan de las del
+SDK, así que la clasificación se conserva; `test_errors.py` lo verifica para cada
+wrapper. (Visto en la prueba real: un 503 de Gemini llegó como `OpenAIAPIError`.)
 Errores de autenticación (401/403), `BadRequestError` (400), key faltante o proveedor
 desconocido **no** están en la tupla: fallan al primer intento. Es la regla de la
 consigna: no reintentar errores permanentes.
@@ -139,8 +144,9 @@ def build_model(provider: str | None = None) -> BaseChatModel:
   base_url=OPENAI_BASE_URL o None, temperature=0, max_retries=0)`.
   `OPENAI_BASE_URL` permite probar gratis con el endpoint compatible de Gemini.
 - `anthropic`: `ChatAnthropic(model=ANTHROPIC_MODEL o "claude-opus-5",
-  api_key=ANTHROPIC_API_KEY, max_retries=0)`. Sin `temperature`: los modelos Claude
-  actuales (Opus 5, Sonnet 5) rechazan el parámetro.
+  api_key=ANTHROPIC_API_KEY, max_tokens=2048, max_retries=0)`. Sin `temperature`: los
+  modelos Claude actuales (Opus 5, Sonnet 5) rechazan el parámetro. `max_tokens=2048`
+  porque el default de langchain-anthropic (128000) hace que el SDK exija streaming.
 - Key faltante o proveedor desconocido lanzan `ValueError` con un mensaje que dice
   qué variable falta y que hay que copiar `.env.example` a `.env`.
 - `max_retries=0` en ambos: `.with_retry()` es la única capa de reintento. Dos capas
@@ -182,7 +188,7 @@ Incrementa `entrada["intento"]` y loguea `INFO` "Intento N: enviando M caractere
 modelo". Funciona porque `with_retry` reutiliza el mismo diccionario de entrada en cada
 intento (verificado en un spike). El prompt ignora la clave extra.
 
-**La cadena** (`build_chain(model: BaseChatModel) -> Runnable`):
+**La cadena** (`build_chain(model: BaseChatModel, *, con_espera: bool = True) -> Runnable`):
 
 ```python
 return (
@@ -193,12 +199,18 @@ return (
 ).with_retry(
     retry_if_exception_type=RECUPERABLES,
     stop_after_attempt=3,
-    wait_exponential_jitter=True,
-)
+    wait_exponential_jitter=con_espera,
+).with_config(callbacks=[LogDeErroresDelModelo()])
 ```
 
-Tres intentos en total (dos reintentos), con backoff exponencial y jitter. Entrada:
-`{"texto": str}`. Salida: `ExtraccionTecnica`.
+Tres intentos en total (dos reintentos), con backoff exponencial y jitter
+(`con_espera=False` lo quita, para tests). Entrada: `{"texto": str}`. Salida:
+`ExtraccionTecnica`.
+
+**Callback `LogDeErroresDelModelo`** (`BaseCallbackHandler` con `on_llm_error`): loguea
+`WARNING` "El proveedor falló: <tipo>: <mensaje>". Los errores del proveedor (429, 5xx,
+red) no pasan por `validar_salida`, así que sin esto un reintento por rate limit no
+dejaría rastro en los logs. Se descubrió en la prueba real con un 503 de Gemini.
 
 **`process_text`**:
 
@@ -221,9 +233,9 @@ con un reintento:
 ```
 INFO  pipeline: Procesando texto de 312 caracteres
 INFO  pipeline: Intento 1: enviando 312 caracteres al modelo
-WARNING pipeline: Intento 1: salida inválida, no cumple el esquema (tecnologias: List should have at least 1 item)
+WARNING pipeline: Salida inválida, no cumple el esquema: 1 validation error for ExtraccionTecnica (tecnologias: List should have at least 1 item)
 INFO  pipeline: Intento 2: enviando 312 caracteres al modelo
-INFO  pipeline: Intento 2: salida válida (3 tecnologías, criticidad alta)
+INFO  pipeline: Salida válida (3 tecnologías, criticidad alta)
 INFO  pipeline: Listo en 2.4 s
 ```
 
@@ -337,6 +349,13 @@ Anthropic. Sin PDF ni informe: la consigna pide que todo esté en el README.
 10. **No se importa el paquete `llm_client` de la Pre-entrega 1.** Sus clientes
     envuelven los SDKs crudos y no son Runnables; lo que se reutiliza es la lógica
     (elección por entorno, una capa de reintento, tests con fakes, `.env.example`).
+11. **Callback `on_llm_error` para loguear errores del proveedor** (agregado tras la
+    prueba real). `with_listeners(on_error=...)` no se dispara con `ainvoke` y
+    `on_retry` no lo llama `with_retry`; `on_llm_error` es el hook que sí se ejecuta en
+    cada fallo del modelo, verificado con el fake.
+12. **`anthropic.OverloadedError` (529) en `RECUPERABLES`**: no hereda de
+    `InternalServerError`, y una sobrecarga momentánea es exactamente lo que un
+    reintento con espera resuelve (la PE1 también lo reintentaba).
 
 ## 10. Limitaciones conocidas
 
