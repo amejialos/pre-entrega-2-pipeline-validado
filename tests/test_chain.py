@@ -2,14 +2,17 @@
 
 import logging
 
+import anthropic
+import openai
 import pytest
 from langchain_core.messages import AIMessage
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import ValidationError
 
-from chain import PROMPT, registrar_intento, validar_salida
+from chain import MAX_INTENTOS, PROMPT, build_chain, registrar_intento, validar_salida
 from errors import SalidaIncompletaError, SalidaInvalidaError
 from schemas import Criticidad, ExtraccionTecnica
+from tests.fakes import FakeChatModel, error_de_conexion, error_http, mensaje_con_herramienta
 
 OBJETO = ExtraccionTecnica(
     tecnologias=["FastAPI", "Redis", "PostgreSQL"],
@@ -96,3 +99,103 @@ def test_parsed_none_sin_parsing_error_tambien_es_invalida():
 
 def test_sin_metadata_no_es_corte():
     assert validar_salida(salida()) is OBJETO
+
+
+# --- La cadena completa, con el fake atravesando el parseo real -----------------------
+
+ARGS_OK = {
+    "tecnologias": ["FastAPI", "Redis", "PostgreSQL"],
+    "nivel_de_criticidad": "alta",
+    "resumen_tecnico": "API con caché y persistencia.",
+}
+ARGS_MAL = {"tecnologias": [], "nivel_de_criticidad": "urgente", "resumen_tecnico": "x"}
+ENTRADA = {"texto": "FastAPI con Redis y PostgreSQL; el pool se agota."}
+
+
+def cadena_con(*respuestas):
+    modelo = FakeChatModel(respuestas=list(respuestas))
+    return build_chain(modelo, con_espera=False), modelo
+
+
+async def test_exito_al_primer_intento():
+    chain, modelo = cadena_con(mensaje_con_herramienta(ARGS_OK, finish_reason="stop"))
+    resultado = await chain.ainvoke(dict(ENTRADA))
+    assert isinstance(resultado, ExtraccionTecnica)
+    assert resultado.tecnologias == ["FastAPI", "Redis", "PostgreSQL"]
+    assert resultado.nivel_de_criticidad is Criticidad.alta
+    assert modelo.llamadas == 1
+
+
+async def test_salida_invalida_y_despues_valida(caplog):
+    caplog.set_level(logging.INFO, logger="pipeline")
+    chain, modelo = cadena_con(
+        mensaje_con_herramienta(ARGS_MAL, finish_reason="stop"),
+        mensaje_con_herramienta(ARGS_OK, finish_reason="stop"),
+    )
+    resultado = await chain.ainvoke(dict(ENTRADA))
+    assert resultado.tecnologias == ["FastAPI", "Redis", "PostgreSQL"]
+    assert modelo.llamadas == 2
+    assert "Intento 1:" in caplog.text
+    assert "Salida inválida" in caplog.text
+    assert "Intento 2:" in caplog.text
+    assert "Salida válida" in caplog.text
+
+
+async def test_cortada_y_despues_valida():
+    chain, modelo = cadena_con(
+        mensaje_con_herramienta(ARGS_OK, finish_reason="length"),
+        mensaje_con_herramienta(ARGS_OK, finish_reason="stop"),
+    )
+    assert (await chain.ainvoke(dict(ENTRADA))).nivel_de_criticidad is Criticidad.alta
+    assert modelo.llamadas == 2
+
+
+async def test_cortada_en_anthropic_y_despues_valida():
+    chain, modelo = cadena_con(
+        mensaje_con_herramienta(ARGS_OK, stop_reason="max_tokens"),
+        mensaje_con_herramienta(ARGS_OK, stop_reason="tool_use"),
+    )
+    await chain.ainvoke(dict(ENTRADA))
+    assert modelo.llamadas == 2
+
+
+async def test_invalida_tres_veces_agota_los_reintentos():
+    chain, modelo = cadena_con(*[mensaje_con_herramienta(ARGS_MAL)] * MAX_INTENTOS)
+    with pytest.raises(SalidaInvalidaError):
+        await chain.ainvoke(dict(ENTRADA))
+    assert modelo.llamadas == MAX_INTENTOS
+
+
+async def test_rate_limit_se_reintenta():
+    chain, modelo = cadena_con(error_http(openai.RateLimitError, 429), mensaje_con_herramienta(ARGS_OK))
+    await chain.ainvoke(dict(ENTRADA))
+    assert modelo.llamadas == 2
+
+
+async def test_error_de_conexion_de_anthropic_se_reintenta():
+    chain, modelo = cadena_con(error_de_conexion(anthropic), mensaje_con_herramienta(ARGS_OK))
+    await chain.ainvoke(dict(ENTRADA))
+    assert modelo.llamadas == 2
+
+
+async def test_error_de_autenticacion_no_se_reintenta():
+    chain, modelo = cadena_con(error_http(openai.AuthenticationError, 401), mensaje_con_herramienta(ARGS_OK))
+    with pytest.raises(openai.AuthenticationError):
+        await chain.ainvoke(dict(ENTRADA))
+    assert modelo.llamadas == 1
+
+
+async def test_bad_request_de_anthropic_no_se_reintenta():
+    chain, modelo = cadena_con(error_http(anthropic.BadRequestError, 400), mensaje_con_herramienta(ARGS_OK))
+    with pytest.raises(anthropic.BadRequestError):
+        await chain.ainvoke(dict(ENTRADA))
+    assert modelo.llamadas == 1
+
+
+async def test_cada_invocacion_cuenta_intentos_desde_uno(caplog):
+    caplog.set_level(logging.INFO, logger="pipeline")
+    chain, _ = cadena_con(mensaje_con_herramienta(ARGS_OK), mensaje_con_herramienta(ARGS_OK))
+    await chain.ainvoke(dict(ENTRADA))
+    await chain.ainvoke(dict(ENTRADA))
+    assert caplog.text.count("Intento 1:") == 2
+    assert "Intento 2:" not in caplog.text

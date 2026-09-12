@@ -9,9 +9,11 @@ todo envuelto en `.with_retry(retry_if_exception_type=RECUPERABLES, stop_after_a
 
 import logging
 
+from langchain_core.language_models import BaseChatModel
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import Runnable, RunnableLambda
 
-from errors import SalidaIncompletaError, SalidaInvalidaError
+from errors import RECUPERABLES, SalidaIncompletaError, SalidaInvalidaError
 from schemas import ExtraccionTecnica
 
 logger = logging.getLogger("pipeline")
@@ -43,6 +45,8 @@ PROMPT = ChatPromptTemplate.from_messages(
 
 # Cómo avisa cada proveedor que cortó la respuesta por falta de tokens.
 CORTES_POR_TOKENS = {"finish_reason": "length", "stop_reason": "max_tokens"}
+
+MAX_INTENTOS = 3
 
 
 def registrar_intento(entrada: dict) -> dict:
@@ -80,3 +84,22 @@ def validar_salida(salida: dict) -> ExtraccionTecnica:
         resultado.nivel_de_criticidad.value,
     )
     return resultado
+
+
+def build_chain(model: BaseChatModel, *, con_espera: bool = True) -> Runnable:
+    """Arma la cadena completa: entrada {"texto": str}, salida ExtraccionTecnica.
+
+    `with_retry` vuelve a ejecutar toda la cadena ante una excepción de RECUPERABLES,
+    hasta MAX_INTENTOS veces, con espera exponencial y jitter. `con_espera=False`
+    quita la espera (para tests). Un error permanente (auth, 400) sale al primer intento.
+    """
+    return (
+        RunnableLambda(registrar_intento)
+        | PROMPT
+        | model.with_structured_output(ExtraccionTecnica, include_raw=True)
+        | RunnableLambda(validar_salida)
+    ).with_retry(
+        retry_if_exception_type=RECUPERABLES,
+        stop_after_attempt=MAX_INTENTOS,
+        wait_exponential_jitter=con_espera,
+    )
