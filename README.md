@@ -175,8 +175,9 @@ validador. De ahí salió el callback `on_llm_error`, que desde entonces escribe
 `WARNING pipeline: El proveedor falló: OpenAIAPIError: Error code: 503 ...` antes de
 cada reintento (verificado en los tests con un 429 real del SDK).
 
-**Un error permanente no se reintenta.** Con una key de Anthropic inválida, cada texto
-hizo una sola llamada (`Intento 1` y nada más) y salió como error controlado:
+**Un error permanente no se reintenta.** Con el placeholder `sk-ant-...` en lugar de
+una key de Anthropic, cada texto hizo una sola llamada (`Intento 1` y nada más) y
+salió como error controlado:
 
 ```
 Proveedor: anthropic-chat, modelo: claude-haiku-4-5
